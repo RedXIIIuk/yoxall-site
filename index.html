@@ -580,6 +580,12 @@
   let editorCellW = 220;
   let editorCellH = 275;
 
+  /** Browser / canvas safety limits (strip is separate from final plate canvas) */
+  const MAX_STRIP_DIM = 8192;
+  const MAX_STRIP_PIXELS = 268435456;
+  /** Render export strip at this multiple of inner px (then scaled to inner) for sharper masks & photos */
+  const STRIP_SUPERSAMPLE = 2;
+
   let cachedMaxDpi = 0;
   function getMaxExportDpi() {
     if (cachedMaxDpi > 0) return cachedMaxDpi;
@@ -594,6 +600,31 @@
     }
     cachedMaxDpi = Math.max(72, dpi);
     return cachedMaxDpi;
+  }
+
+  /** Shrink strip size proportionally if it exceeds canvas limits */
+  function clampStripDimensions(wIn, hIn) {
+    let w = Math.max(1, Math.round(wIn));
+    let h = Math.max(1, Math.round(hIn));
+    let s = 1;
+    if (w > MAX_STRIP_DIM) s = Math.min(s, MAX_STRIP_DIM / w);
+    if (h > MAX_STRIP_DIM) s = Math.min(s, MAX_STRIP_DIM / h);
+    if (w * h > MAX_STRIP_PIXELS) s = Math.min(s, Math.sqrt(MAX_STRIP_PIXELS / (w * h)));
+    w = Math.max(1, Math.floor(w * s));
+    h = Math.max(1, Math.floor(h * s));
+    return { w, h };
+  }
+
+  /** Plate & inner size in pixels at max export DPI */
+  function getExportPlatePixels() {
+    const dpi = getMaxExportDpi();
+    const ppm = dpi / 25.4;
+    const W = Math.round(MM_PLATE_W * ppm);
+    const H = Math.round(MM_PLATE_H * ppm);
+    const border = Math.round(MM_BORDER * ppm);
+    const innerW = Math.max(1, W - 2 * border);
+    const innerH = Math.max(1, H - 2 * border);
+    return { dpi, W, H, border, innerW, innerH };
   }
 
   /** Bold display stacks for all-caps masking (Impact default). */
@@ -612,11 +643,48 @@
     return FONT_STACKS[k] || FONT_STACKS.impact;
   }
 
-  /** @type {{ char: string, img: HTMLImageElement | null, scale: number, ox: number, oy: number, cellW: number, cellH: number, layoutFontSize: number, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, fileInput: HTMLInputElement, zoomInput: HTMLInputElement, zoomNumber: HTMLInputElement, zoomLabel: HTMLElement }[]} */
+  /** @type {{ char: string, img: HTMLImageElement | null, scale: number, ox: number, oy: number, cellW: number, cellH: number, layoutFontSize: number, canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, fileInput: HTMLInputElement, zoomInput: HTMLInputElement, zoomNumber: HTMLInputElement, zoomLabel: HTMLElement, btnFit: HTMLButtonElement }[]} */
   let slots = [];
 
   function allowedChars(word) {
     return word.toUpperCase().split("").filter(c => /[A-Z0-9]/.test(c));
+  }
+
+  /** Their word first, then random meme-y kebab (new pick each download) */
+  function exportPngFilename(rawWord) {
+    const w = (rawWord || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 24) || "YAY";
+    const memes = [
+      "cat-slayer",
+      "built-different",
+      "main-character-energy",
+      "certified-menace",
+      "chaos-gremlin",
+      "no-thoughts-head-empty",
+      "absolute-unit",
+      "just-vibes",
+      "based",
+      "goated-with-the-sauce",
+      "slay-king",
+      "legend-status",
+      "maxxing",
+      "core-memory",
+      "sending-it",
+      "era",
+      "locked-in",
+      "unhinged-but-correct",
+      "touch-grass-later",
+      "main-event",
+      "chef-kiss",
+      "its-giving-art",
+      "main-character",
+      "npc-repellent",
+      "sigma-grindset",
+      "full-send",
+    ];
+    return `${w}-${memes[Math.floor(Math.random() * memes.length)]}.png`;
   }
 
   function setStatus(text, kind) {
@@ -705,7 +773,10 @@
    * Draw one masked letter into an existing context (uses destination-in — isolate to small canvases only).
    * @param {number | null} forcedFontSize  If set (px for this canvas), used instead of auto fit — for packed row layout.
    */
-  function drawMaskedLetter(ctx, w, h, letter, img, scale, ox, oy, outlinePx, forcedFontSize) {
+  /**
+   * @param {{ hiResUpscale?: boolean } | undefined} opts  Export path: pre-upscale tiny uploads so large prints stay cleaner
+   */
+  function drawMaskedLetter(ctx, w, h, letter, img, scale, ox, oy, outlinePx, forcedFontSize, opts) {
     if (!letter) return;
 
     const fontSize =
@@ -721,9 +792,37 @@
 
     ctx.save();
     if (img && img.complete && img.naturalWidth > 0) {
+      ctx.imageSmoothingEnabled = true;
+      if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "high";
+      let drawImg = img;
+      let drawScale = scale;
+      if (opts && opts.hiResUpscale) {
+        const nw = img.naturalWidth;
+        const nh = img.naturalHeight;
+        const projected = Math.max(nw, nh) * Math.abs(scale);
+        const need = Math.max(w, h);
+        if (projected > 0 && projected < need * 0.9) {
+          const boost = Math.min(8, need / projected);
+          if (boost > 1.06) {
+            const uw = Math.min(MAX_STRIP_DIM, Math.ceil(nw * boost));
+            const uh = Math.min(MAX_STRIP_DIM, Math.ceil(nh * boost));
+            const oc = document.createElement("canvas");
+            oc.width = Math.max(1, uw);
+            oc.height = Math.max(1, uh);
+            const ox2 = oc.getContext("2d");
+            if (ox2) {
+              ox2.imageSmoothingEnabled = true;
+              if ("imageSmoothingQuality" in ox2) ox2.imageSmoothingQuality = "high";
+              ox2.drawImage(img, 0, 0, oc.width, oc.height);
+              drawImg = oc;
+              drawScale = scale / boost;
+            }
+          }
+        }
+      }
       ctx.translate(cx + ox, cy + oy);
-      ctx.scale(scale, scale);
-      ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+      ctx.scale(drawScale, drawScale);
+      ctx.drawImage(drawImg, -drawImg.width / 2, -drawImg.height / 2);
     } else {
       ctx.fillStyle = "#12161f";
       ctx.fillRect(0, 0, w, h);
@@ -745,9 +844,11 @@
 
   /**
    * Render one letter to its own canvas so compositing never wipes other letters on a shared surface.
-   * Scales photo by target height vs editor ref so glyphs and images stay proportional (fixes tiny photos on export).
+   * Photo pan/zoom are scaled from preview cell → this cell (sx, imageScale).
+   * Mask font: `packedFontSize` comes from the same computePackedLayout as this cell, so it already
+   * matches c.height — do not multiply by c/refH (that was for old preview-only strips and breaks hi-res export).
    */
-  function letterToOffscreen(slot, w, h, outlinePx, packedFontSizeAtPreview) {
+  function letterToOffscreen(slot, w, h, outlinePx, packedFontSize, hiResUpscale) {
     const c = document.createElement("canvas");
     c.width = Math.max(1, Math.round(w));
     c.height = Math.max(1, Math.round(h));
@@ -758,8 +859,14 @@
     const sx = c.width / refW;
     const sy = c.height / refH;
     const imageScale = slot.scale * (c.height / refH);
-    const pfs = packedFontSizeAtPreview > 0 ? packedFontSizeAtPreview : slot.layoutFontSize;
-    const drawFs = pfs > 0 ? pfs * (c.height / refH) : null;
+    const pfs = packedFontSize > 0 ? packedFontSize : slot.layoutFontSize;
+    const drawFs =
+      pfs > 0
+        ? packedFontSize > 0
+          ? pfs
+          : pfs * (c.height / refH)
+        : null;
+    const letterOpts = hiResUpscale ? { hiResUpscale: true } : undefined;
     drawMaskedLetter(
       ctx,
       c.width,
@@ -770,7 +877,8 @@
       slot.ox * sx,
       slot.oy * sy,
       outlinePx,
-      drawFs
+      drawFs,
+      letterOpts
     );
     return c;
   }
@@ -867,7 +975,9 @@
     return { n, gapPx: g, widths, ch, fontSize, totalWidth };
   }
 
-  function drawPackedRow(ctx, originX, originY, innerWpx, layout) {
+  /** @param {{ hiResPhoto?: boolean } | undefined} drawOpts */
+  function drawPackedRow(ctx, originX, originY, innerWpx, layout, drawOpts) {
+    const hiRes = !!(drawOpts && drawOpts.hiResPhoto);
     const { widths, gapPx, ch, fontSize } = layout;
     const total = layout.totalWidth;
     let x = originX + Math.floor((innerWpx - total) / 2);
@@ -875,7 +985,7 @@
       const slot = slots[i];
       const cw = widths[i];
       const oPx = outlinePxAtHeight(ch);
-      const piece = letterToOffscreen(slot, cw, ch, oPx, fontSize);
+      const piece = letterToOffscreen(slot, cw, ch, oPx, fontSize, hiRes);
       ctx.drawImage(piece, Math.round(x), Math.round(originY));
       x += cw + gapPx;
     }
@@ -895,7 +1005,7 @@
 
     const charList = slots.map(s => s.char);
     const layout = computePackedLayout(innerW, innerH, gapPrev, charList);
-    if (layout) drawPackedRow(xctx, 0, 0, innerW, layout);
+    if (layout) drawPackedRow(xctx, 0, 0, innerW, layout, { hiResPhoto: false });
 
   }
 
@@ -923,6 +1033,24 @@
 
   function resetSlot(slot) {
     slot.scale = 1;
+    slot.ox = 0;
+    slot.oy = 0;
+    renderSlot(slot);
+    updateZoomLabel(slot);
+    renderExportPreview();
+  }
+
+  /** Scale photo to cover the letter viewport (min upscaling capped at 100%); center pan */
+  function fitPhotoToLetter(slot) {
+    const im = slot.img;
+    if (!im || !im.complete || im.naturalWidth <= 0 || im.naturalHeight <= 0) return;
+    const w = slot.canvas.width;
+    const h = slot.canvas.height;
+    if (w <= 0 || h <= 0) return;
+    const nw = im.naturalWidth;
+    const nh = im.naturalHeight;
+    const cover = Math.max(w / nw, h / nh);
+    slot.scale = Math.min(SCALE_MAX, Math.max(SCALE_MIN, cover));
     slot.ox = 0;
     slot.oy = 0;
     renderSlot(slot);
@@ -1040,18 +1168,19 @@
     zoomLabel.className = "zoom-val";
     zoomLabel.textContent = "100%";
 
-    const btnResetOne = document.createElement("button");
-    btnResetOne.type = "button";
-    btnResetOne.className = "btn secondary small";
-    btnResetOne.textContent = "Reset";
-    btnResetOne.title = "Reset this letter’s photo pan and zoom to defaults";
+    const btnFit = document.createElement("button");
+    btnFit.type = "button";
+    btnFit.className = "btn secondary small";
+    btnFit.textContent = "Fit";
+    btnFit.title = "Best fit — scale photo to fill this letter; drag to reposition";
+    btnFit.disabled = true;
 
     zoomRow.appendChild(zoomMinus);
     zoomRow.appendChild(zoomInput);
     zoomRow.appendChild(zoomPlus);
     zoomRow.appendChild(zoomNumber);
     zoomRow.appendChild(zoomLabel);
-    zoomRow.appendChild(btnResetOne);
+    zoomRow.appendChild(btnFit);
 
     const fileInput = document.createElement("input");
     fileInput.type = "file";
@@ -1090,6 +1219,7 @@
       zoomInput,
       zoomNumber,
       zoomLabel,
+      btnFit,
     };
 
     zoomInput.addEventListener("input", () => {
@@ -1104,7 +1234,7 @@
     zoomPlus.addEventListener("click", () => {
       applyZoomFromInput(slot, Number(zoomInput.value) + 5);
     });
-    btnResetOne.addEventListener("click", () => resetSlot(slot));
+    btnFit.addEventListener("click", () => fitPhotoToLetter(slot));
 
     fileInput.addEventListener("change", () => {
       const f = fileInput.files && fileInput.files[0];
@@ -1114,7 +1244,8 @@
       im.onload = () => {
         URL.revokeObjectURL(url);
         slot.img = im;
-        resetSlot(slot);
+        btnFit.disabled = false;
+        fitPhotoToLetter(slot);
       };
       im.onerror = () => URL.revokeObjectURL(url);
       im.src = url;
@@ -1123,6 +1254,7 @@
     clearBtn.addEventListener("click", () => {
       slot.img = null;
       fileInput.value = "";
+      btnFit.disabled = true;
       resetSlot(slot);
     });
 
@@ -1179,40 +1311,33 @@
         s.oy = p.oy;
         updateZoomLabel(s);
       }
+      if (s.img && s.img.complete && s.btnFit) s.btnFit.disabled = false;
       slots.push(s);
     });
     renderAll();
   }
 
   /**
-   * Master strip at preview pixel size — identical pipeline to on-screen combined preview.
-   * Re-rendering masks at multi‑k px breaks canvas text + destination-in on many browsers.
+   * Raster strip — layout at strip pixel size (preview = low px; print = supersampled inner).
    */
-  function buildMasterStripCanvas() {
-    const innerW = PREVIEW_INNER_W;
-    const innerH = innerHeightPreviewPx();
-    const gapPrev = Math.max(0, Math.round((EXPORT_GAP_MM * innerW) / MM_INNER_W));
+  function buildMasterStripCanvas(targetStripW, targetStripH, drawOpts) {
+    const { w, h } = clampStripDimensions(targetStripW, targetStripH);
+    const gapPrev = Math.max(0, Math.round((EXPORT_GAP_MM * w) / MM_INNER_W));
     const charList = slots.map(s => s.char);
-    const layout = computePackedLayout(innerW, innerH, gapPrev, charList);
+    const layout = computePackedLayout(w, h, gapPrev, charList);
     const strip = document.createElement("canvas");
-    strip.width = Math.max(1, innerW);
-    strip.height = Math.max(1, innerH);
+    strip.width = Math.max(1, w);
+    strip.height = Math.max(1, h);
     const sctx = strip.getContext("2d");
     if (!sctx || !layout) return strip;
     sctx.setTransform(1, 0, 0, 1, 0, 0);
     sctx.clearRect(0, 0, strip.width, strip.height);
-    drawPackedRow(sctx, 0, 0, innerW, layout);
+    drawPackedRow(sctx, 0, 0, w, layout, drawOpts);
     return strip;
   }
 
   function buildPrintReadyCanvas() {
-    const dpi = getMaxExportDpi();
-    const pxPerMm = dpi / 25.4;
-    const W = Math.round(MM_PLATE_W * pxPerMm);
-    const H = Math.round(MM_PLATE_H * pxPerMm);
-    const b = Math.round(MM_BORDER * pxPerMm);
-    const innerW = Math.max(1, W - 2 * b);
-    const innerH = Math.max(1, H - 2 * b);
+    const { W, H, border, innerW, innerH } = getExportPlatePixels();
 
     const canvas = document.createElement("canvas");
     canvas.width = W;
@@ -1223,12 +1348,16 @@
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, W, H);
 
-    const strip = buildMasterStripCanvas();
     if (slots.length === 0) return canvas;
 
+    const strip = buildMasterStripCanvas(
+      Math.round(innerW * STRIP_SUPERSAMPLE),
+      Math.round(innerH * STRIP_SUPERSAMPLE),
+      { hiResPhoto: true }
+    );
     ctx.imageSmoothingEnabled = true;
     if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(strip, 0, 0, strip.width, strip.height, b, b, innerW, innerH);
+    ctx.drawImage(strip, 0, 0, strip.width, strip.height, border, border, innerW, innerH);
 
     return canvas;
   }
@@ -1247,12 +1376,10 @@
       return;
     }
     const word = (wordInput.value || "").trim() || "(none)";
-    const base =
-      (wordInput.value || "lithophane").replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "lithophane";
     const fd = new FormData();
     fd.append("_subject", `Letter mask — ${word}`);
     fd.append("word", word);
-    fd.append("attachment", blob, `${base}.png`);
+    fd.append("attachment", blob, exportPngFilename(wordInput.value));
 
     btnEmail.disabled = true;
     try {
@@ -1296,9 +1423,7 @@
         return;
       }
       const a = document.createElement("a");
-      const base = (wordInput.value || "lithophane").replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "lithophane";
-      const dpi = getMaxExportDpi();
-      a.download = `${base}-${MM_PLATE_W}x${MM_PLATE_H}mm-${dpi}dpi-max.png`;
+      a.download = exportPngFilename(wordInput.value);
       a.href = URL.createObjectURL(blob);
       a.click();
       URL.revokeObjectURL(a.href);
